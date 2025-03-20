@@ -1599,4 +1599,5 @@ int CNAME(blas_arg_t *args, BLASLONG *range_m, BLASLONG *range_n, IFLOAT *sa, IF
   }
 
   return 0;
+
 }
