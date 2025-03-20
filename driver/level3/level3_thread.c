@@ -244,701 +244,282 @@ typedef struct {
   BLASLONG sve_vl;             // SVE vector length in bytes
 } threadContext;
 
-// Get SVE vector length at runtime
-static inline int get_sve_vl(void) {
-  #ifdef __ARM_FEATURE_SVE
-    int vl = 0;
-    __asm__ volatile("rdvl %0, #1" : "=r"(vl));
-    return vl;  // Returns vector length in bytes
-  #else
-    return 16;  // Fallback for non-SVE compilation
-  #endif
-}
 
-// Graviton3-specific block size optimization
-static inline BLASLONG optimize_block_size(BLASLONG size, BLASLONG sve_vl) {
-  // Align block sizes to SVE vector length for better performance
-  BLASLONG aligned_size = (size + sve_vl - 1) & ~(sve_vl - 1);
-  return aligned_size;
-}
 
-// #ifdef USE_TASK
+
 static int task_execution(blas_queue_t *queue, BLASLONG nthreads) {
- threadContext context[nthreads];
- BLASLONG workLeft = 0;
- 
- // Initialize ThreadContext for each thread
- #pragma omp parallel num_threads(nthreads)
- {
-   #pragma omp for
-   for(int mpos = 0; mpos < nthreads; mpos++) {
-     context[mpos].args = queue[mpos].args;
-     context[mpos].range_m = queue[mpos].range_m;
-     context[mpos].range_n = queue[mpos].range_n;
-     context[mpos].sa = queue[mpos].sa;
-     context[mpos].sb = queue[mpos].sb;
-     context[mpos].job = (job_t *)queue[mpos].args->common;
-     context[mpos].earlyReturn = 0;
-     context[mpos].min_l = 0;
-     blas_arg_t *args = context[mpos].args;
-     context[mpos].k = K;
-     context[mpos].a = (IFLOAT *)A;
-     context[mpos].b = (IFLOAT *)B;
-     context[mpos].c = (FLOAT *)C;
-     context[mpos].lda = LDA;
-     context[mpos].ldb = LDB;
-     context[mpos].ldc = LDC;
-     context[mpos].ls = 0;
-     context[mpos].alpha = (FLOAT *)args->alpha;
-     context[mpos].beta = (FLOAT *)args->beta;
-     
-     /* Initialize 2D CPU distribution */
-     context[mpos].nthreads_m = args->nthreads;
-     if (context[mpos].range_m) {
-       context[mpos].nthreads_m = context[mpos].range_m[-1];
-     }
-     context[mpos].mypos_n = blas_quickdivide(mpos, context[mpos].nthreads_m);
-     context[mpos].mypos_m = mpos - context[mpos].mypos_n * context[mpos].nthreads_m;
-     
-     /* Initialize m and n */
-     context[mpos].m_from = 0;
-     context[mpos].m_to = M;
-     if (context[mpos].range_m) {
-       context[mpos].m_from = context[mpos].range_m[context[mpos].mypos_m + 0];
-       context[mpos].m_to = context[mpos].range_m[context[mpos].mypos_m + 1];
-     }
-     context[mpos].n_from = 0;
-     context[mpos].n_to = N;
-     if (context[mpos].range_n) {
-       context[mpos].n_from = context[mpos].range_n[mpos + 0];
-       context[mpos].n_to = context[mpos].range_n[mpos + 1];
-     }
-     
-     /* Multiply C by beta if needed */
-     if (context[mpos].beta) {
-#ifndef COMPLEX
-       if (context[mpos].beta[0] != ONE)
-#else
-       if ((context[mpos].beta[0] != ONE) || (context[mpos].beta[1] != ZERO))
-#endif
-         BETA_OPERATION(context[mpos].m_from, context[mpos].m_to, 
-                        context[mpos].range_n[context[mpos].mypos_n * context[mpos].nthreads_m], 
-                        context[mpos].range_n[(context[mpos].mypos_n + 1) * context[mpos].nthreads_m], 
-                        context[mpos].beta, context[mpos].c, context[mpos].ldc);
-     }
-     
-     /* Return early if no more computation is needed */
-     if ((context[mpos].k == 0) || (context[mpos].alpha == NULL)) context[mpos].earlyReturn = 1;
-     if (context[mpos].alpha[0] == ZERO
-#ifdef COMPLEX
-         && context[mpos].alpha[1] == ZERO
-#endif
-     ) context[mpos].earlyReturn = 1;
-     
-     BLASLONG div_n;
-     /* Initialize workspace for local region of B */
-     div_n = (context[mpos].n_to - context[mpos].n_from + DIVIDE_RATE - 1) / DIVIDE_RATE;
-     context[mpos].buffer[0] = context[mpos].sb;
-     for (BLASLONG i = 1; i < DIVIDE_RATE; i++) {
-       context[mpos].buffer[i] = context[mpos].buffer[i - 1] + 
-                                GEMM_Q * ((div_n + GEMM_UNROLL_N - 1)/GEMM_UNROLL_N) * 
-                                GEMM_UNROLL_N * COMPSIZE;
-     }
-   }
-
-   // Ensure all threads complete initialization before proceeding
-   #pragma omp barrier
-
-   // Core work distribution using a persistent thread model for better utilization
-   #pragma omp single
-   {
-     // Create a large pool of tasks to keep all cores busy
-     // This approach ensures better load distribution across all cores
-     const int TASK_MULTIPLIER = 4; // Generate more tasks than cores for better balancing
-     const int MAX_TASKS = nthreads * TASK_MULTIPLIER;
-     int total_tasks_created = 0;
-     
-     while(1) {
-       workLeft = 0;
-       total_tasks_created = 0;
-       
-       // Generate tasks with aggressive partitioning for better core utilization
-       #pragma omp taskloop shared(context, workLeft) num_tasks(MAX_TASKS)
-       for(int mpos = 0; mpos < nthreads; mpos++) {
-         context[mpos].ls += context[mpos].min_l;
-         if((context[mpos].earlyReturn == 1) || (context[mpos].ls >= context[mpos].k)) continue;
-         
-         #pragma omp atomic write
-         workLeft = 1;
-         
-         #pragma omp atomic update
-         total_tasks_created++;
-         
-         /* Determine step size in k */
-         context[mpos].min_l = context[mpos].k - context[mpos].ls;
-         if (context[mpos].min_l >= GEMM_Q * 2) {
-           context[mpos].min_l = GEMM_Q;
-         } else {
-           if (context[mpos].min_l > GEMM_Q) context[mpos].min_l = (context[mpos].min_l + 1) / 2;
-         }
-         
-         context[mpos].pad_min_l = context[mpos].min_l;
+  threadContext context[nthreads];
+  BLASLONG workLeft = 0;
+  //Initialize ThreadContext for each thread
+  #pragma omp parallel num_threads(nthreads)
+  {
+  
+  #pragma omp for
+  for(int mpos= 0; mpos < nthreads; mpos++) {
+    
+    context[mpos].args = queue[mpos].args;
+    context[mpos].range_m = queue[mpos].range_m;
+    context[mpos].range_n = queue[mpos].range_n;
+    context[mpos].sa = queue[mpos].sa;
+    context[mpos].sb = queue[mpos].sb;
+    context[mpos].job = (job_t *)queue[mpos].args -> common;
+    context[mpos].earlyReturn = 0;
+    context[mpos].min_l = 0;
+    blas_arg_t *args = context[mpos].args;
+    context[mpos].k = K;
+    context[mpos].a = (IFLOAT *)A;
+    context[mpos].b = (IFLOAT *)B;
+    context[mpos].c = (FLOAT *)C;
+    context[mpos].lda = LDA;
+    context[mpos].ldb = LDB;
+    context[mpos].ldc = LDC;
+    context[mpos].ls  = 0;
+    context[mpos].alpha = (FLOAT *)args -> alpha;
+    context[mpos].beta  = (FLOAT *)args -> beta;
+    /* Initialize 2D CPU distribution */
+    context[mpos].nthreads_m = args -> nthreads;
+    if (context[mpos].range_m) {
+      context[mpos].nthreads_m = context[mpos].range_m[-1];
+    }
+    context[mpos].mypos_n = blas_quickdivide(mpos, context[mpos].nthreads_m);  /* mypos_n = mypos / nthreads_m */
+    context[mpos].mypos_m = mpos - context[mpos].mypos_n * context[mpos].nthreads_m;         /* mypos_m = mypos % nthreads_m */
+    /* Initialize m and n */
+    context[mpos].m_from = 0;
+    context[mpos].m_to   = M;
+    if (context[mpos].range_m) {
+      context[mpos].m_from = context[mpos].range_m[context[mpos].mypos_m + 0];
+      context[mpos].m_to   = context[mpos].range_m[context[mpos].mypos_m + 1];
+    }
+    context[mpos].n_from = 0;
+    context[mpos].n_to   = N;
+    if (context[mpos].range_n) {
+      context[mpos].n_from = context[mpos].range_n[mpos + 0];
+      context[mpos].n_to   = context[mpos].range_n[mpos + 1];
+    }
+    /* Multiply C by beta if needed */
+    if (context[mpos].beta) {
+  #ifndef COMPLEX
+      if (context[mpos].beta[0] != ONE)
+  #else
+      if ((context[mpos].beta[0] != ONE) || (context[mpos].beta[1] != ZERO))
+  #endif
+        BETA_OPERATION(context[mpos].m_from, context[mpos].m_to, context[mpos].range_n[context[mpos].mypos_n * context[mpos].nthreads_m], context[mpos].range_n[(context[mpos].mypos_n + 1) * context[mpos].nthreads_m], context[mpos].beta, context[mpos].c, context[mpos].ldc);
+    }
+    /* Return early if no more computation is needed */
+    if ((context[mpos].k == 0) || (context[mpos].alpha == NULL)) context[mpos].earlyReturn = 1;
+    if (context[mpos].alpha[0] == ZERO
+  #ifdef COMPLEX
+        && context[mpos].alpha[1] == ZERO
+  #endif
+      ) context[mpos].earlyReturn = 1;
+    BLASLONG div_n;
+      /* Initialize workspace for local region of B */
+    div_n = (context[mpos].n_to - context[mpos].n_from + DIVIDE_RATE - 1) / DIVIDE_RATE;
+    context[mpos].buffer[0] = context[mpos].sb;
+    for (BLASLONG i = 1; i < DIVIDE_RATE; i++) {
+      context[mpos].buffer[i] = context[mpos].buffer[i - 1] + GEMM_Q * ((div_n + GEMM_UNROLL_N - 1)/GEMM_UNROLL_N) * GEMM_UNROLL_N * COMPSIZE;
+    }
+  }
+  #pragma omp single
+  {
+  while(1) {
+    workLeft = 0;
+  #pragma omp taskloop
+  for(int mpos = 0; mpos < nthreads; mpos++) {
+    context[mpos].ls += context[mpos].min_l;
+    if((context[mpos].earlyReturn == 1) || (context[mpos].ls >= context[mpos].k)) continue;
+      workLeft = 1;
+       /* Determine step size in k */
+    context[mpos].min_l = context[mpos].k - context[mpos].ls;
+    if (context[mpos].min_l >= GEMM_Q * 2) {
+      context[mpos].min_l  = GEMM_Q;
+    } else {
+      if (context[mpos].min_l > GEMM_Q) context[mpos].min_l = (context[mpos].min_l + 1) / 2;
+    }
+    
+    context[mpos].pad_min_l = context[mpos].min_l;
 #if defined(HALF)
 #if defined(DYNAMIC_ARCH)
-         context[mpos].pad_min_l = (context[mpos].min_l + gotoblas->sbgemm_align_k - 1) & ~(gotoblas->sbgemm_align_k-1);
+    context[mpos].pad_min_l = (context[mpos].min_l + gotoblas->sbgemm_align_k - 1) & ~(gotoblas->sbgemm_align_k-1);
 #else
-         context[mpos].pad_min_l = (context[mpos].min_l + SBGEMM_ALIGN_K - 1) & ~(SBGEMM_ALIGN_K - 1);
+    context[mpos].pad_min_l = (context[mpos].min_l + SBGEMM_ALIGN_K - 1) & ~(SBGEMM_ALIGN_K - 1);;
 #endif
 #endif
-         /* Determine step size in m */
-         context[mpos].l1stride = 1;
-         context[mpos].min_i = context[mpos].m_to - context[mpos].m_from;
-         
-         // Optimize block size for Graviton3 cache
-         if (context[mpos].min_i >= GEMM_P * 2) {
-           context[mpos].min_i = GEMM_P;
-         } else {
-           if (context[mpos].min_i > GEMM_P) {
-             // Smaller chunks for better parallelism
-             context[mpos].min_i = ((context[mpos].min_i / 2 + GEMM_UNROLL_M - 1)/GEMM_UNROLL_M) * GEMM_UNROLL_M;
-           } else {
-             if (context[mpos].args->nthreads == 1) context[mpos].l1stride = 0;
-           }
-         }
+    /* Determine step size in m
+     * Note: We are currently on the first step in m
+     */
+    context[mpos].l1stride = 1;
+    context[mpos].min_i = context[mpos].m_to - context[mpos].m_from;
+    if (context[mpos].min_i >= GEMM_P * 2) {
+      context[mpos].min_i = GEMM_P;
+    } else {
+      if (context[mpos].min_i > GEMM_P) {
+	context[mpos].min_i = ((context[mpos].min_i / 2 + GEMM_UNROLL_M - 1)/GEMM_UNROLL_M) * GEMM_UNROLL_M;
+      } else {
+	if (context[mpos].args -> nthreads == 1) context[mpos].l1stride = 0;
+      }
+    }
 
-         // Copy local region of A into workspace
-         START_RPCC();
-         ICOPY_OPERATION(context[mpos].min_l, context[mpos].min_i, 
-                         context[mpos].a, context[mpos].lda, 
-                         context[mpos].ls, context[mpos].m_from, 
-                         context[mpos].sa);
-         STOP_RPCC(copy_A);
-         
-         // Copy local region of B into workspace and apply kernel
-         BLASLONG div_n = (context[mpos].n_to - context[mpos].n_from + DIVIDE_RATE - 1) / DIVIDE_RATE;
-         
-         // Create inner tasks for better core utilization - split the work among cores
-         for (BLASLONG js = context[mpos].n_from, bufferside = 0; 
-              js < context[mpos].n_to; 
-              js += div_n, bufferside++) {
-           
-           // Make sure no one is using the workspace
-           START_RPCC();
-           for (BLASLONG i = 0; i < context[mpos].args->nthreads; i++) {
-             while (context[mpos].job[mpos].working[i][CACHE_LINE_SIZE * bufferside]) {YIELDING;};
-           }
-           STOP_RPCC(waiting1);
-           MB;
-           
+    // #pragma omp task firstprivate(mpos) depend(out : orderT1[mpos])
+    BLASLONG bufferside, div_n, min_jj;
+    /* Copy local region of A into workspace */
+    START_RPCC();
+    ICOPY_OPERATION(context[mpos].min_l, context[mpos].min_i, context[mpos].a, context[mpos].lda, context[mpos].ls, context[mpos].m_from, context[mpos].sa);
+    STOP_RPCC(copy_A);
+    /* Copy local region of B into workspace and apply kernel */
+    div_n = (context[mpos].n_to - context[mpos].n_from + DIVIDE_RATE - 1) / DIVIDE_RATE;
+    for (BLASLONG js = context[mpos].n_from, bufferside = 0; js < context[mpos].n_to; js += div_n, bufferside ++) {
+      /* Make sure if no one is using workspace */
+      START_RPCC();
+      for (BLASLONG i = 0; i < context[mpos].args -> nthreads; i++)
+	while (context[mpos].job[mpos].working[i][CACHE_LINE_SIZE * bufferside]) {YIELDING;};
+      STOP_RPCC(waiting1);
+      MB;
 #if defined(FUSED_GEMM) && !defined(TIMING)
-           // Fused operation to copy region of B into workspace and apply kernel
-           FUSED_KERNEL_OPERATION(context[mpos].min_i, 
-                                  MIN(context[mpos].n_to, js + div_n) - js, 
-                                  context[mpos].min_l, context[mpos].alpha,
-                                  context[mpos].sa, context[mpos].buffer[bufferside], 
-                                  context[mpos].b, context[mpos].ldb, 
-                                  context[mpos].c, context[mpos].ldc, 
-                                  context[mpos].m_from, js, context[mpos].ls);
+      /* Fused operation to copy region of B into workspace and apply kernel */
+      FUSED_KERNEL_OPERATION(context[mpos].min_i, MIN(context[mpos].n_to, js + div_n) - js, context[mpos].min_l, context[mpos].alpha,
+			     context[mpos].sa, context[mpos].buffer[bufferside], context[mpos].b, context[mpos].ldb, context[mpos].c, context[mpos].ldc, context[mpos].m_from, js, context[mpos].ls);
 #else
-           // For better core utilization, create smaller chunks
-           // Graviton3 benefits from smaller, more numerous tasks
-           BLASLONG jjs = js;
-           BLASLONG js_end = MIN(context[mpos].n_to, js + div_n);
-           BLASLONG chunk_size = (js_end - jjs) / MAX(1, nthreads/4);
-           chunk_size = MAX(chunk_size, GEMM_UNROLL_N);  // Ensure minimum chunk size
-           
-           while (jjs < js_end) {
-             BLASLONG current_chunk = MIN(chunk_size, js_end - jjs);
-             BLASLONG min_jj = current_chunk;
-             
-             // Optimize the chunk size for better vectorization
+      /* Split local region of B into parts */
+      for(BLASLONG jjs = js; jjs < MIN(context[mpos].n_to, js + div_n); jjs += min_jj){
+	min_jj = MIN(context[mpos].n_to, js + div_n) - jjs;
 #if defined(SKYLAKEX) || defined(COOPERLAKE) || defined(SAPPHIRERAPIDS)
-             if (min_jj >= 6*GEMM_UNROLL_N) min_jj = 6*GEMM_UNROLL_N;
+	/* the current AVX512 s/d/c/z GEMM kernel requires n>=6*GEMM_UNROLL_N to achieve the best performance */
+	if (min_jj >= 6*GEMM_UNROLL_N) min_jj = 6*GEMM_UNROLL_N;
 #else
-             // Optimize for Graviton3's SVE units
-             if (min_jj >= 4*GEMM_UNROLL_N) min_jj = 4*GEMM_UNROLL_N;
-             else if (min_jj >= 2*GEMM_UNROLL_N) min_jj = 2*GEMM_UNROLL_N;
-             else if (min_jj > GEMM_UNROLL_N) min_jj = GEMM_UNROLL_N;
+	if (min_jj >= 3*GEMM_UNROLL_N) min_jj = 3*GEMM_UNROLL_N;
+	else
+/*
+          if (min_jj >= 2*GEMM_UNROLL_N) min_jj = 2*GEMM_UNROLL_N;
+          else
+*/
+            if (min_jj > GEMM_UNROLL_N) min_jj = GEMM_UNROLL_N;
 #endif
-             
-             // Copy part of local region of B into workspace
-             START_RPCC();
-             OCOPY_OPERATION(context[mpos].min_l, min_jj, 
-                            context[mpos].b, context[mpos].ldb, 
-                            context[mpos].ls, jjs,
-                            context[mpos].buffer[bufferside] + 
-                            context[mpos].pad_min_l * (jjs - js) * COMPSIZE * context[mpos].l1stride);
-             STOP_RPCC(copy_B);
-             
-             // Apply kernel with local region of A and part of local region of B
-             START_RPCC();
-             KERNEL_OPERATION(context[mpos].min_i, min_jj, context[mpos].min_l, context[mpos].alpha,
-                             context[mpos].sa, 
-                             context[mpos].buffer[bufferside] + 
-                             context[mpos].pad_min_l * (jjs - js) * COMPSIZE * context[mpos].l1stride,
-                             context[mpos].c, context[mpos].ldc, 
-                             context[mpos].m_from, jjs);
-             STOP_RPCC(kernel);
-             
+        /* Copy part of local region of B into workspace */
+	START_RPCC();
+	OCOPY_OPERATION(context[mpos].min_l, min_jj, context[mpos].b, context[mpos].ldb, context[mpos].ls, jjs,
+			context[mpos].buffer[bufferside] + context[mpos].pad_min_l * (jjs - js) * COMPSIZE * context[mpos].l1stride);
+	STOP_RPCC(copy_B);
+        /* Apply kernel with local region of A and part of local region of B */
+	START_RPCC();
+	KERNEL_OPERATION(context[mpos].min_i, min_jj, context[mpos].min_l, context[mpos].alpha,
+			 context[mpos].sa, context[mpos].buffer[bufferside] + context[mpos].pad_min_l * (jjs - js) * COMPSIZE * context[mpos].l1stride,
+			 context[mpos].c, context[mpos].ldc, context[mpos].m_from, jjs);
+	STOP_RPCC(kernel);
 #ifdef TIMING
-             ops += 2 * context[mpos].min_i * min_jj * context[mpos].min_l;
+        ops += 2 * context[mpos].min_i * min_jj * context[mpos].min_l;
 #endif
-             
-             // Move to next chunk
-             jjs += min_jj;
-           }
+      }
 #endif
-           WMB;
-           
-           // Set flag so other threads can access local region of B
-           for (BLASLONG i = context[mpos].mypos_n * context[mpos].nthreads_m; 
-                i < (context[mpos].mypos_n + 1) * context[mpos].nthreads_m; i++) {
-             context[mpos].job[mpos].working[i][CACHE_LINE_SIZE * bufferside] = 
-                 (BLASLONG)context[mpos].buffer[bufferside];
-           }
-         }
-       }
+      WMB;
+      /* Set flag so other threads can access local region of B */
+      for (BLASLONG i = context[mpos].mypos_n * context[mpos].nthreads_m; i < (context[mpos].mypos_n + 1) * context[mpos].nthreads_m; i++)
+        context[mpos].job[mpos].working[i][CACHE_LINE_SIZE * bufferside] = (BLASLONG)context[mpos].buffer[bufferside];
+    }
+  }
 
-       // Explicitly ensure that all cores stay busy processing tasks
-       // This improves work stealing and load balance
-       #pragma omp taskwait
+#pragma omp taskloop
+for(int mpos = 0; mpos < nthreads; mpos++) {
+  
+  if(context[mpos].earlyReturn == 1 || (context[mpos].ls >= context[mpos].k)) continue;
+      workLeft = 1;
+    BLASLONG current, div_n, bufferside;
+    /* Get regions of B from other threads and apply kernel */
+    current = mpos;
+    do {
+      /* This thread accesses regions of B from threads in the range
+       * [ mypos_n * nthreads_m, (mypos_n+1) * nthreads_m ) */
+      current ++;
+      if (current >= (context[mpos].mypos_n + 1) * context[mpos].nthreads_m) current = context[mpos].mypos_n * context[mpos].nthreads_m;
+      /* Split other region of B into parts */
+      div_n = (context[mpos].range_n[current + 1]  - context[mpos].range_n[current] + DIVIDE_RATE - 1) / DIVIDE_RATE;
+      for (BLASLONG js = context[mpos].range_n[current], bufferside = 0; js < context[mpos].range_n[current + 1]; js += div_n, bufferside ++) {
+        if (current != mpos) {
+	  /* Wait until other region of B is initialized */
+	  START_RPCC();
+	  while(context[mpos].job[current].working[mpos][CACHE_LINE_SIZE * bufferside] == 0) {YIELDING;};
+	  STOP_RPCC(waiting2);
+	  MB;
+          /* Apply kernel with local region of A and part of other region of B */
+	  START_RPCC();
+	  KERNEL_OPERATION(context[mpos].min_i, MIN(context[mpos].range_n[current + 1]  - js,  div_n), context[mpos].min_l, context[mpos].alpha,
+			   context[mpos].sa, (IFLOAT *)context[mpos].job[current].working[mpos][CACHE_LINE_SIZE * bufferside],
+			   context[mpos].c, context[mpos].ldc, context[mpos].m_from, js);
+          STOP_RPCC(kernel);
+#ifdef TIMING
+	  ops += 2 * context[mpos].min_i * MIN(context[mpos].range_n[current + 1]  - js,  div_n) * context[mpos].min_l;
+#endif
+	}
+        /* Clear synchronization flag if this thread is done with other region of B */
+	if (context[mpos].m_to - context[mpos].m_from == context[mpos].min_i) {
+	  WMB;
+	  context[mpos].job[current].working[mpos][CACHE_LINE_SIZE * bufferside] &= 0;
+	}
+      }
+    } while (current != mpos);
+    /* Iterate through steps of m 
+     * Note: First step has already been finished */
+    for(BLASLONG is = context[mpos].m_from + context[mpos].min_i; is < context[mpos].m_to; is += context[mpos].min_i){
+      context[mpos].min_i = context[mpos].m_to - is;
+      if (context[mpos].min_i >= GEMM_P * 2) {
+	context[mpos].min_i = GEMM_P;
+      } else
+	if (context[mpos].min_i > GEMM_P) {
+	  context[mpos].min_i = (((context[mpos].min_i + 1) / 2 + GEMM_UNROLL_M - 1)/GEMM_UNROLL_M) * GEMM_UNROLL_M;
+	}
+      /* Copy local region of A into workspace */
+      START_RPCC();
+      ICOPY_OPERATION(context[mpos].min_l, context[mpos].min_i, context[mpos].a, context[mpos].lda, context[mpos].ls, is, context[mpos].sa);
+      STOP_RPCC(copy_A);
+      /* Get regions of B and apply kernel */
+      current = mpos;
+      do {
+        /* Split region of B into parts and apply kernel */
+	div_n = (context[mpos].range_n[current + 1]  - context[mpos].range_n[current] + DIVIDE_RATE - 1) / DIVIDE_RATE;
+	for (BLASLONG js = context[mpos].range_n[current], bufferside = 0; js < context[mpos].range_n[current + 1]; js += div_n, bufferside ++) {
+          /* Apply kernel with local region of A and part of region of B */
+	  START_RPCC();
+	  KERNEL_OPERATION(context[mpos].min_i, MIN(context[mpos].range_n[current + 1] - js, div_n), context[mpos].min_l, context[mpos].alpha,
+			   context[mpos].sa, (IFLOAT *)context[mpos].job[current].working[mpos][CACHE_LINE_SIZE * bufferside],
+			   context[mpos].c, context[mpos].ldc, is, js);
+          STOP_RPCC(kernel);
+          
+#ifdef TIMING
+          ops += 2 * context[mpos].min_i * MIN(context[mpos].range_n[current + 1]  - js, div_n) * context[mpos].min_l;
+#endif
+          
+          /* Clear synchronization flag if this thread is done with region of B */
+          if (is +context[mpos]. min_i >= context[mpos].m_to) {
+            WMB;
+            context[mpos].job[current].working[mpos][CACHE_LINE_SIZE * bufferside] &= 0;
+          }
+	}
+        /* This thread accesses regions of B from threads in the range
+         * [ mypos_n * nthreads_m, (mypos_n+1) * nthreads_m ) */
+	current ++;
+	if (current >= (context[mpos].mypos_n + 1) * context[mpos].nthreads_m) current = context[mpos].mypos_n * context[mpos].nthreads_m;
+      } while (current != mpos);
+    }
+  }
 
-       // Second phase of computation with dependencies on the first phase
-       // Create enough tasks to keep all cores busy
-       #pragma omp taskloop shared(context, workLeft) num_tasks(MAX_TASKS)
-       for(int mpos = 0; mpos < nthreads; mpos++) {
-         if(context[mpos].earlyReturn == 1 || (context[mpos].ls >= context[mpos].k)) continue;
-         
-         // Ensure workLeft is set with atomic operation for thread safety
-         #pragma omp atomic write
-         workLeft = 1;
-         
-         BLASLONG current, div_n, bufferside;
-         
-         // Get regions of B from other threads and apply kernel
-         current = mpos;
-         do {
-           // This thread accesses regions of B from threads in the range
-           // [ mypos_n * nthreads_m, (mypos_n+1) * nthreads_m )
-           current++;
-           if (current >= (context[mpos].mypos_n + 1) * context[mpos].nthreads_m) 
-             current = context[mpos].mypos_n * context[mpos].nthreads_m;
-           
-           // Process other threads' data in smaller chunks for better parallelism
-           div_n = (context[mpos].range_n[current + 1] - context[mpos].range_n[current] + DIVIDE_RATE - 1) / DIVIDE_RATE;
-           
-           for (BLASLONG js = context[mpos].range_n[current], bufferside = 0; 
-                js < context[mpos].range_n[current + 1]; 
-                js += div_n, bufferside++) {
-             
-             if (current != mpos) {
-               // Wait until other region of B is initialized
-               START_RPCC();
-               while(context[mpos].job[current].working[mpos][CACHE_LINE_SIZE * bufferside] == 0) {YIELDING;};
-               STOP_RPCC(waiting2);
-               MB;
-               
-               // Process data in smaller chunks to aid core utilization
-               BLASLONG js_curr = js;
-               BLASLONG js_end = MIN(context[mpos].range_n[current + 1], js + div_n);
-               BLASLONG chunk_size = (js_end - js_curr) / MAX(1, nthreads/4);
-               chunk_size = MAX(chunk_size, GEMM_UNROLL_N); // Ensure minimum chunk size
-               
-               while (js_curr < js_end) {
-                 BLASLONG current_chunk = MIN(chunk_size, js_end - js_curr);
-                 
-                 // Apply kernel with local region of A and chunk of other region of B
-                 START_RPCC();
-                 KERNEL_OPERATION(context[mpos].min_i, current_chunk, context[mpos].min_l, 
-                                 context[mpos].alpha, context[mpos].sa, 
-                                 (IFLOAT *)context[mpos].job[current].working[mpos][CACHE_LINE_SIZE * bufferside],
-                                 context[mpos].c, context[mpos].ldc, 
-                                 context[mpos].m_from, js_curr);
-                 STOP_RPCC(kernel);
-                 
+  if(workLeft == 0) break;
+  }
+  }
 #ifdef TIMING
-                 ops += 2 * context[mpos].min_i * current_chunk * context[mpos].min_l;
+  BLASLONG waiting = waiting1 + waiting2 + waiting3;
+  BLASLONG total = copy_A + copy_B + kernel + waiting;
+  fprintf(stderr, "GEMM   [%2ld] Copy_A : %6.2f  Copy_B : %6.2f  Wait1 : %6.2f Wait2 : %6.2f Wait3 : %6.2f Kernel : %6.2f",
+	  mpos, (double)copy_A /(double)total * 100., (double)copy_B /(double)total * 100.,
+	  (double)waiting1 /(double)total * 100.,
+	  (double)waiting2 /(double)total * 100.,
+	  (double)waiting3 /(double)total * 100.,
+	  (double)ops/(double)kernel / 4. * 100.);
+  fprintf(stderr, "\n");
 #endif
-                 
-                 // Move to next chunk
-                 js_curr += current_chunk;
-               }
-             }
-             
-             // Clear synchronization flag if this thread is done with other region of B
-             if (context[mpos].m_to - context[mpos].m_from == context[mpos].min_i) {
-               WMB;
-               context[mpos].job[current].working[mpos][CACHE_LINE_SIZE * bufferside] &= 0;
-             }
-           }
-         } while (current != mpos);
-         
-         // Iterate through steps of m with fine-grained partitioning
-         for(BLASLONG is = context[mpos].m_from + context[mpos].min_i; 
-             is < context[mpos].m_to; 
-             is += context[mpos].min_i) {
-           
-           context[mpos].min_i = context[mpos].m_to - is;
-           if (context[mpos].min_i >= GEMM_P * 2) {
-             context[mpos].min_i = GEMM_P;
-           } else if (context[mpos].min_i > GEMM_P) {
-             // Smaller chunks for better load balancing
-             context[mpos].min_i = (((context[mpos].min_i + 1) / 2 + GEMM_UNROLL_M - 1)/GEMM_UNROLL_M) * GEMM_UNROLL_M;
-           }
-           
-           // Copy local region of A into workspace
-           START_RPCC();
-           ICOPY_OPERATION(context[mpos].min_l, context[mpos].min_i, 
-                          context[mpos].a, context[mpos].lda, 
-                          context[mpos].ls, is, context[mpos].sa);
-           STOP_RPCC(copy_A);
-           
-           // Process all B matrices with fine-grained parallelism
-           current = mpos;
-           do {
-             div_n = (context[mpos].range_n[current + 1] - context[mpos].range_n[current] + DIVIDE_RATE - 1) / DIVIDE_RATE;
-             
-             for (BLASLONG js = context[mpos].range_n[current], bufferside = 0; 
-                  js < context[mpos].range_n[current + 1]; 
-                  js += div_n, bufferside++) {
-               
-               // Process in smaller chunks for better core utilization
-               BLASLONG js_curr = js;
-               BLASLONG js_end = MIN(context[mpos].range_n[current + 1], js + div_n);
-               BLASLONG chunk_size = (js_end - js_curr) / MAX(1, nthreads/4);
-               chunk_size = MAX(chunk_size, GEMM_UNROLL_N); // Ensure minimum chunk size
-               
-               while (js_curr < js_end) {
-                 BLASLONG current_chunk = MIN(chunk_size, js_end - js_curr);
-                 
-                 // Apply kernel with current region of A and chunk of B
-                 START_RPCC();
-                 KERNEL_OPERATION(context[mpos].min_i, current_chunk, context[mpos].min_l, 
-                                 context[mpos].alpha, context[mpos].sa, 
-                                 (IFLOAT *)context[mpos].job[current].working[mpos][CACHE_LINE_SIZE * bufferside],
-                                 context[mpos].c, context[mpos].ldc, is, js_curr);
-                 STOP_RPCC(kernel);
-                 
-#ifdef TIMING
-                 ops += 2 * context[mpos].min_i * current_chunk * context[mpos].min_l;
-#endif
-                 
-                 // Move to next chunk
-                 js_curr += current_chunk;
-               }
-               
-               // Clear synchronization flag if this thread is done with region of B
-               if (is + context[mpos].min_i >= context[mpos].m_to) {
-                 WMB;
-                 context[mpos].job[current].working[mpos][CACHE_LINE_SIZE * bufferside] &= 0;
-               }
-             }
-             
-             // Move to next thread's data
-             current++;
-             if (current >= (context[mpos].mypos_n + 1) * context[mpos].nthreads_m) 
-               current = context[mpos].mypos_n * context[mpos].nthreads_m;
-               
-           } while (current != mpos);
-         }
-       }
-
-       // Ensure all tasks are complete before checking workLeft
-       #pragma omp taskwait
-       
-       // Exit if no more work
-       if(workLeft == 0) break;
-     }
-   }
- }
- 
-#ifdef TIMING
- BLASLONG waiting = waiting1 + waiting2 + waiting3;
- BLASLONG total = copy_A + copy_B + kernel + waiting;
- fprintf(stderr, "GEMM   [%2ld] Copy_A : %6.2f  Copy_B : %6.2f  Wait1 : %6.2f Wait2 : %6.2f Wait3 : %6.2f Kernel : %6.2f",
-         mpos, (double)copy_A /(double)total * 100., (double)copy_B /(double)total * 100.,
-         (double)waiting1 /(double)total * 100.,
-         (double)waiting2 /(double)total * 100.,
-         (double)waiting3 /(double)total * 100.,
-         (double)ops/(double)kernel / 4. * 100.);
- fprintf(stderr, "\n");
-#endif
- return 0;
+  }
+  return 0;
 }
 #endif
-// static int task_execution(blas_queue_t *queue, BLASLONG nthreads) {
-//   threadContext context[nthreads];
-//   BLASLONG workLeft = 0;
-//   //Initialize ThreadContext for each thread
-//   #pragma omp parallel num_threads(nthreads)
-//   {
-  
-//   #pragma omp for
-//   for(int mpos= 0; mpos < nthreads; mpos++) {
-    
-//     context[mpos].args = queue[mpos].args;
-//     context[mpos].range_m = queue[mpos].range_m;
-//     context[mpos].range_n = queue[mpos].range_n;
-//     context[mpos].sa = queue[mpos].sa;
-//     context[mpos].sb = queue[mpos].sb;
-//     context[mpos].job = (job_t *)queue[mpos].args -> common;
-//     context[mpos].earlyReturn = 0;
-//     context[mpos].min_l = 0;
-//     blas_arg_t *args = context[mpos].args;
-//     context[mpos].k = K;
-//     context[mpos].a = (IFLOAT *)A;
-//     context[mpos].b = (IFLOAT *)B;
-//     context[mpos].c = (FLOAT *)C;
-//     context[mpos].lda = LDA;
-//     context[mpos].ldb = LDB;
-//     context[mpos].ldc = LDC;
-//     context[mpos].ls  = 0;
-//     context[mpos].alpha = (FLOAT *)args -> alpha;
-//     context[mpos].beta  = (FLOAT *)args -> beta;
-//     /* Initialize 2D CPU distribution */
-//     context[mpos].nthreads_m = args -> nthreads;
-//     if (context[mpos].range_m) {
-//       context[mpos].nthreads_m = context[mpos].range_m[-1];
-//     }
-//     context[mpos].mypos_n = blas_quickdivide(mpos, context[mpos].nthreads_m);  /* mypos_n = mypos / nthreads_m */
-//     context[mpos].mypos_m = mpos - context[mpos].mypos_n * context[mpos].nthreads_m;         /* mypos_m = mypos % nthreads_m */
-//     /* Initialize m and n */
-//     context[mpos].m_from = 0;
-//     context[mpos].m_to   = M;
-//     if (context[mpos].range_m) {
-//       context[mpos].m_from = context[mpos].range_m[context[mpos].mypos_m + 0];
-//       context[mpos].m_to   = context[mpos].range_m[context[mpos].mypos_m + 1];
-//     }
-//     context[mpos].n_from = 0;
-//     context[mpos].n_to   = N;
-//     if (context[mpos].range_n) {
-//       context[mpos].n_from = context[mpos].range_n[mpos + 0];
-//       context[mpos].n_to   = context[mpos].range_n[mpos + 1];
-//     }
-//     /* Multiply C by beta if needed */
-//     if (context[mpos].beta) {
-//   #ifndef COMPLEX
-//       if (context[mpos].beta[0] != ONE)
-//   #else
-//       if ((context[mpos].beta[0] != ONE) || (context[mpos].beta[1] != ZERO))
-//   #endif
-//         BETA_OPERATION(context[mpos].m_from, context[mpos].m_to, context[mpos].range_n[context[mpos].mypos_n * context[mpos].nthreads_m], context[mpos].range_n[(context[mpos].mypos_n + 1) * context[mpos].nthreads_m], context[mpos].beta, context[mpos].c, context[mpos].ldc);
-//     }
-//     /* Return early if no more computation is needed */
-//     if ((context[mpos].k == 0) || (context[mpos].alpha == NULL)) context[mpos].earlyReturn = 1;
-//     if (context[mpos].alpha[0] == ZERO
-//   #ifdef COMPLEX
-//         && context[mpos].alpha[1] == ZERO
-//   #endif
-//       ) context[mpos].earlyReturn = 1;
-//     BLASLONG div_n;
-//       /* Initialize workspace for local region of B */
-//     div_n = (context[mpos].n_to - context[mpos].n_from + DIVIDE_RATE - 1) / DIVIDE_RATE;
-//     context[mpos].buffer[0] = context[mpos].sb;
-//     for (BLASLONG i = 1; i < DIVIDE_RATE; i++) {
-//       context[mpos].buffer[i] = context[mpos].buffer[i - 1] + GEMM_Q * ((div_n + GEMM_UNROLL_N - 1)/GEMM_UNROLL_N) * GEMM_UNROLL_N * COMPSIZE;
-//     }
-//   }
-//   #pragma omp single
-//   {
-//   while(1) {
-//     workLeft = 0;
-//   #pragma omp taskloop
-//   for(int mpos = 0; mpos < nthreads; mpos++) {
-//     context[mpos].ls += context[mpos].min_l;
-//     if((context[mpos].earlyReturn == 1) || (context[mpos].ls >= context[mpos].k)) continue;
-//       workLeft = 1;
-//        /* Determine step size in k */
-//     context[mpos].min_l = context[mpos].k - context[mpos].ls;
-//     if (context[mpos].min_l >= GEMM_Q * 2) {
-//       context[mpos].min_l  = GEMM_Q;
-//     } else {
-//       if (context[mpos].min_l > GEMM_Q) context[mpos].min_l = (context[mpos].min_l + 1) / 2;
-//     }
-    
-//     context[mpos].pad_min_l = context[mpos].min_l;
-// #if defined(HALF)
-// #if defined(DYNAMIC_ARCH)
-//     context[mpos].pad_min_l = (context[mpos].min_l + gotoblas->sbgemm_align_k - 1) & ~(gotoblas->sbgemm_align_k-1);
-// #else
-//     context[mpos].pad_min_l = (context[mpos].min_l + SBGEMM_ALIGN_K - 1) & ~(SBGEMM_ALIGN_K - 1);;
-// #endif
-// #endif
-//     /* Determine step size in m
-//      * Note: We are currently on the first step in m
-//      */
-//     context[mpos].l1stride = 1;
-//     context[mpos].min_i = context[mpos].m_to - context[mpos].m_from;
-//     if (context[mpos].min_i >= GEMM_P * 2) {
-//       context[mpos].min_i = GEMM_P;
-//     } else {
-//       if (context[mpos].min_i > GEMM_P) {
-// 	context[mpos].min_i = ((context[mpos].min_i / 2 + GEMM_UNROLL_M - 1)/GEMM_UNROLL_M) * GEMM_UNROLL_M;
-//       } else {
-// 	if (context[mpos].args -> nthreads == 1) context[mpos].l1stride = 0;
-//       }
-//     }
-
-//     // #pragma omp task firstprivate(mpos) depend(out : orderT1[mpos])
-//     BLASLONG bufferside, div_n, min_jj;
-//     /* Copy local region of A into workspace */
-//     START_RPCC();
-//     ICOPY_OPERATION(context[mpos].min_l, context[mpos].min_i, context[mpos].a, context[mpos].lda, context[mpos].ls, context[mpos].m_from, context[mpos].sa);
-//     STOP_RPCC(copy_A);
-//     /* Copy local region of B into workspace and apply kernel */
-//     div_n = (context[mpos].n_to - context[mpos].n_from + DIVIDE_RATE - 1) / DIVIDE_RATE;
-//     for (BLASLONG js = context[mpos].n_from, bufferside = 0; js < context[mpos].n_to; js += div_n, bufferside ++) {
-//       /* Make sure if no one is using workspace */
-//       START_RPCC();
-//       for (BLASLONG i = 0; i < context[mpos].args -> nthreads; i++)
-// 	while (context[mpos].job[mpos].working[i][CACHE_LINE_SIZE * bufferside]) {YIELDING;};
-//       STOP_RPCC(waiting1);
-//       MB;
-// #if defined(FUSED_GEMM) && !defined(TIMING)
-//       /* Fused operation to copy region of B into workspace and apply kernel */
-//       FUSED_KERNEL_OPERATION(context[mpos].min_i, MIN(context[mpos].n_to, js + div_n) - js, context[mpos].min_l, context[mpos].alpha,
-// 			     context[mpos].sa, context[mpos].buffer[bufferside], context[mpos].b, context[mpos].ldb, context[mpos].c, context[mpos].ldc, context[mpos].m_from, js, context[mpos].ls);
-// #else
-//       /* Split local region of B into parts */
-//       for(BLASLONG jjs = js; jjs < MIN(context[mpos].n_to, js + div_n); jjs += min_jj){
-// 	min_jj = MIN(context[mpos].n_to, js + div_n) - jjs;
-// #if defined(SKYLAKEX) || defined(COOPERLAKE) || defined(SAPPHIRERAPIDS)
-// 	/* the current AVX512 s/d/c/z GEMM kernel requires n>=6*GEMM_UNROLL_N to achieve the best performance */
-// 	if (min_jj >= 6*GEMM_UNROLL_N) min_jj = 6*GEMM_UNROLL_N;
-// #else
-// 	if (min_jj >= 3*GEMM_UNROLL_N) min_jj = 3*GEMM_UNROLL_N;
-// 	else
-// /*
-//           if (min_jj >= 2*GEMM_UNROLL_N) min_jj = 2*GEMM_UNROLL_N;
-//           else
-// */
-//             if (min_jj > GEMM_UNROLL_N) min_jj = GEMM_UNROLL_N;
-// #endif
-//         /* Copy part of local region of B into workspace */
-// 	START_RPCC();
-// 	OCOPY_OPERATION(context[mpos].min_l, min_jj, context[mpos].b, context[mpos].ldb, context[mpos].ls, jjs,
-// 			context[mpos].buffer[bufferside] + context[mpos].pad_min_l * (jjs - js) * COMPSIZE * context[mpos].l1stride);
-// 	STOP_RPCC(copy_B);
-//         /* Apply kernel with local region of A and part of local region of B */
-// 	START_RPCC();
-// 	KERNEL_OPERATION(context[mpos].min_i, min_jj, context[mpos].min_l, context[mpos].alpha,
-// 			 context[mpos].sa, context[mpos].buffer[bufferside] + context[mpos].pad_min_l * (jjs - js) * COMPSIZE * context[mpos].l1stride,
-// 			 context[mpos].c, context[mpos].ldc, context[mpos].m_from, jjs);
-// 	STOP_RPCC(kernel);
-// #ifdef TIMING
-//         ops += 2 * context[mpos].min_i * min_jj * context[mpos].min_l;
-// #endif
-//       }
-// #endif
-//       WMB;
-//       /* Set flag so other threads can access local region of B */
-//       for (BLASLONG i = context[mpos].mypos_n * context[mpos].nthreads_m; i < (context[mpos].mypos_n + 1) * context[mpos].nthreads_m; i++)
-//         context[mpos].job[mpos].working[i][CACHE_LINE_SIZE * bufferside] = (BLASLONG)context[mpos].buffer[bufferside];
-//     }
-//   }
-
-// #pragma omp taskloop
-// for(int mpos = 0; mpos < nthreads; mpos++) {
-  
-//   if(context[mpos].earlyReturn == 1 || (context[mpos].ls >= context[mpos].k)) continue;
-//       workLeft = 1;
-//     BLASLONG current, div_n, bufferside;
-//     /* Get regions of B from other threads and apply kernel */
-//     current = mpos;
-//     do {
-//       /* This thread accesses regions of B from threads in the range
-//        * [ mypos_n * nthreads_m, (mypos_n+1) * nthreads_m ) */
-//       current ++;
-//       if (current >= (context[mpos].mypos_n + 1) * context[mpos].nthreads_m) current = context[mpos].mypos_n * context[mpos].nthreads_m;
-//       /* Split other region of B into parts */
-//       div_n = (context[mpos].range_n[current + 1]  - context[mpos].range_n[current] + DIVIDE_RATE - 1) / DIVIDE_RATE;
-//       for (BLASLONG js = context[mpos].range_n[current], bufferside = 0; js < context[mpos].range_n[current + 1]; js += div_n, bufferside ++) {
-//         if (current != mpos) {
-// 	  /* Wait until other region of B is initialized */
-// 	  START_RPCC();
-// 	  while(context[mpos].job[current].working[mpos][CACHE_LINE_SIZE * bufferside] == 0) {YIELDING;};
-// 	  STOP_RPCC(waiting2);
-// 	  MB;
-//           /* Apply kernel with local region of A and part of other region of B */
-// 	  START_RPCC();
-// 	  KERNEL_OPERATION(context[mpos].min_i, MIN(context[mpos].range_n[current + 1]  - js,  div_n), context[mpos].min_l, context[mpos].alpha,
-// 			   context[mpos].sa, (IFLOAT *)context[mpos].job[current].working[mpos][CACHE_LINE_SIZE * bufferside],
-// 			   context[mpos].c, context[mpos].ldc, context[mpos].m_from, js);
-//           STOP_RPCC(kernel);
-// #ifdef TIMING
-// 	  ops += 2 * context[mpos].min_i * MIN(context[mpos].range_n[current + 1]  - js,  div_n) * context[mpos].min_l;
-// #endif
-// 	}
-//         /* Clear synchronization flag if this thread is done with other region of B */
-// 	if (context[mpos].m_to - context[mpos].m_from == context[mpos].min_i) {
-// 	  WMB;
-// 	  context[mpos].job[current].working[mpos][CACHE_LINE_SIZE * bufferside] &= 0;
-// 	}
-//       }
-//     } while (current != mpos);
-//     /* Iterate through steps of m 
-//      * Note: First step has already been finished */
-//     for(BLASLONG is = context[mpos].m_from + context[mpos].min_i; is < context[mpos].m_to; is += context[mpos].min_i){
-//       context[mpos].min_i = context[mpos].m_to - is;
-//       if (context[mpos].min_i >= GEMM_P * 2) {
-// 	context[mpos].min_i = GEMM_P;
-//       } else
-// 	if (context[mpos].min_i > GEMM_P) {
-// 	  context[mpos].min_i = (((context[mpos].min_i + 1) / 2 + GEMM_UNROLL_M - 1)/GEMM_UNROLL_M) * GEMM_UNROLL_M;
-// 	}
-//       /* Copy local region of A into workspace */
-//       START_RPCC();
-//       ICOPY_OPERATION(context[mpos].min_l, context[mpos].min_i, context[mpos].a, context[mpos].lda, context[mpos].ls, is, context[mpos].sa);
-//       STOP_RPCC(copy_A);
-//       /* Get regions of B and apply kernel */
-//       current = mpos;
-//       do {
-//         /* Split region of B into parts and apply kernel */
-// 	div_n = (context[mpos].range_n[current + 1]  - context[mpos].range_n[current] + DIVIDE_RATE - 1) / DIVIDE_RATE;
-// 	for (BLASLONG js = context[mpos].range_n[current], bufferside = 0; js < context[mpos].range_n[current + 1]; js += div_n, bufferside ++) {
-//           /* Apply kernel with local region of A and part of region of B */
-// 	  START_RPCC();
-// 	  KERNEL_OPERATION(context[mpos].min_i, MIN(context[mpos].range_n[current + 1] - js, div_n), context[mpos].min_l, context[mpos].alpha,
-// 			   context[mpos].sa, (IFLOAT *)context[mpos].job[current].working[mpos][CACHE_LINE_SIZE * bufferside],
-// 			   context[mpos].c, context[mpos].ldc, is, js);
-//           STOP_RPCC(kernel);
-          
-// #ifdef TIMING
-//           ops += 2 * context[mpos].min_i * MIN(context[mpos].range_n[current + 1]  - js, div_n) * context[mpos].min_l;
-// #endif
-          
-//           /* Clear synchronization flag if this thread is done with region of B */
-//           if (is +context[mpos]. min_i >= context[mpos].m_to) {
-//             WMB;
-//             context[mpos].job[current].working[mpos][CACHE_LINE_SIZE * bufferside] &= 0;
-//           }
-// 	}
-//         /* This thread accesses regions of B from threads in the range
-//          * [ mypos_n * nthreads_m, (mypos_n+1) * nthreads_m ) */
-// 	current ++;
-// 	if (current >= (context[mpos].mypos_n + 1) * context[mpos].nthreads_m) current = context[mpos].mypos_n * context[mpos].nthreads_m;
-//       } while (current != mpos);
-//     }
-//   }
-
-//   if(workLeft == 0) break;
-//   }
-//   }
-// #ifdef TIMING
-//   BLASLONG waiting = waiting1 + waiting2 + waiting3;
-//   BLASLONG total = copy_A + copy_B + kernel + waiting;
-//   fprintf(stderr, "GEMM   [%2ld] Copy_A : %6.2f  Copy_B : %6.2f  Wait1 : %6.2f Wait2 : %6.2f Wait3 : %6.2f Kernel : %6.2f",
-// 	  mpos, (double)copy_A /(double)total * 100., (double)copy_B /(double)total * 100.,
-// 	  (double)waiting1 /(double)total * 100.,
-// 	  (double)waiting2 /(double)total * 100.,
-// 	  (double)waiting3 /(double)total * 100.,
-// 	  (double)ops/(double)kernel / 4. * 100.);
-//   fprintf(stderr, "\n");
-// #endif
-//   }
-//   return 0;
-// }
-// #endif
 
 static int inner_thread(blas_arg_t *args, BLASLONG *range_m, BLASLONG *range_n, IFLOAT *sa, IFLOAT *sb, BLASLONG mypos){
 
