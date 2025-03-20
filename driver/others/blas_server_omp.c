@@ -114,10 +114,8 @@ void goto_set_num_threads(int num_threads) {
 
   adjust_thread_buffers();
 #if defined(ARCH_MIPS64) || defined(ARCH_LOONGARCH64)
-#ifndef DYNAMIC_ARCH
   //set parameters for different number of threads.
   blas_set_parameter();
-#endif
 #endif
 
 }
@@ -125,18 +123,6 @@ void openblas_set_num_threads(int num_threads) {
 
 	goto_set_num_threads(num_threads);
 }
-
-#ifdef OS_LINUX
-
-int openblas_setaffinity(int thread_idx, size_t cpusetsize, cpu_set_t* cpu_set) {
-  fprintf(stderr,"OpenBLAS: use OpenMP environment variables for setting cpu affinity\n");
-  return -1;
-}
-int openblas_getaffinity(int thread_idx, size_t cpusetsize, cpu_set_t* cpu_set) {
-  fprintf(stderr,"OpenBLAS: use OpenMP environment variables for querying cpu affinity\n");
-  return -1;
-}
-#endif
 
 int blas_thread_init(void){
 
@@ -321,7 +307,6 @@ static void exec_threads(int thread_num, blas_queue_t *queue, int buf_index){
 
     pos= thread_num;
     buffer = blas_thread_buffer[buf_index][pos];
-
     //fallback
     if(buffer==NULL) {
       buffer = blas_memory_alloc(2);
@@ -391,6 +376,10 @@ fprintf(stderr,"UNHANDLED COMPLEX\n");
       (pthreadcompat)(queue -> args);
 
     } else {
+      #ifdef USE_TASK
+        if(queue->args->taskEnabled) return;
+      #endif
+
       int (*routine)(blas_arg_t *, void *, void *, void *, void *, BLASLONG) = queue -> routine;
 
       (routine)(queue -> args, queue -> range_m, queue -> range_n, sa, sb, queue -> position);
@@ -421,6 +410,9 @@ int exec_blas(BLASLONG num, blas_queue_t *queue){
   }
 #endif
 
+  // fprintf(stderr, "Line Number = 413 \nFunction Name = exec_blas() \nFile Name = blas_server_omp.c\n");
+  // fprintf(stderr, "MAX_PARALLEL_NUMBER : %d\n", MAX_PARALLEL_NUMBER);
+
 while (true) {
     for(i=0; i < MAX_PARALLEL_NUMBER; i++) {
 #ifdef HAVE_C11
@@ -437,6 +429,7 @@ while (true) {
     if(i != MAX_PARALLEL_NUMBER)
       break;
   }
+
   /*For caller-managed threading, if caller has registered the callback, pass exec_thread as callback function*/
   if (openblas_threads_callback_) {
 #ifndef USE_SIMPLE_THREADED_LEVEL3
@@ -462,8 +455,15 @@ while (true) {
     queue[i].position = i;
 #endif
 
-  exec_threads(omp_get_thread_num(), &queue[i], buf_index);
+  exec_threads(i, &queue[i], buf_index);
   }
+
+  #ifdef USE_TASK
+    if(queue->args->taskEnabled) {
+      int (*routine)(blas_queue_t *, BLASLONG) = queue -> routine;
+      (routine)(queue, num);
+    }
+  #endif
 }
 }
 

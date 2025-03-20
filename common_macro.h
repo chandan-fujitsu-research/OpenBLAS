@@ -70,7 +70,6 @@
 #define	SUM_K			QSUM_K
 #define	SWAP_K			QSWAP_K
 #define	ROT_K			QROT_K
-#define	ROTM_K			QROTM_K
 
 #define	GEMV_N			QGEMV_N
 #define	GEMV_T			QGEMV_T
@@ -362,7 +361,6 @@
 #define	SUM_K			DSUM_K
 #define	SWAP_K			DSWAP_K
 #define	ROT_K			DROT_K
-#define ROTM_K      DROTM_K
 
 #define	GEMV_N			DGEMV_N
 #define	GEMV_T			DGEMV_T
@@ -979,7 +977,6 @@
 #define	SUM_K			SSUM_K
 #define	SWAP_K			SSWAP_K
 #define	ROT_K			SROT_K
-#define	ROTM_K			SROTM_K
 
 #define	GEMV_N			SGEMV_N
 #define	GEMV_T			SGEMV_T
@@ -2643,7 +2640,7 @@ extern BLASLONG xgemm_r;
 
 typedef struct {
   void *a, *b, *c, *d, *alpha, *beta;
-  BLASLONG	m, n, k, lda, ldb, ldc, ldd;
+  BLASLONG	m, n, k, lda, ldb, ldc, ldd, taskEnabled;
 
 #ifdef SMP
   void *common;

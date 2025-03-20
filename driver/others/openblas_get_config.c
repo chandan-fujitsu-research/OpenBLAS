@@ -60,6 +60,12 @@ static char* openblas_config_str=""
 #ifdef USE_OPENMP
   "USE_OPENMP "
 #endif
+#ifdef USE_TASK
+  "USE_TASK "
+#endif
+#ifdef USE_DYNAMIC_BUFFER_POLICY
+  "USE_DYNAMIC_BUFFER_POLICY "
+#endif
 #ifdef USE_TLS
   "USE_TLS "
 #endif
